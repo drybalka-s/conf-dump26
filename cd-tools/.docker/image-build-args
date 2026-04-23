@@ -1,0 +1,43 @@
+# Helm - CLI tool for managing Charts - https://github.com/helm/helm/releases
+HELM_VERSION=4.1.0
+HELM_SHA256SUM=519950df50409cb78e460668913de49497f96eb7e229aa584d3a7ed953e7adc7
+
+# Helm plugin helmdiff - https://github.com/databus23/helm-diff
+HELM_PLUGIN_DIFF_VERSION=3.14.1
+HELM_PLUGIN_DIFF_SHA256SUM=d3a1566bd17b5ec394ce9eaa2c9aa3052ac7ade0dff13cc69dc3a6c13669afef
+
+# Helm plugin secret -  https://github.com/jkroepke/helm-secrets/releases
+HELM_PLUGIN_SECRET_VERSION=4.7.4
+HELM_PLUGIN_SECRET_SHA256SUM=f5366ce6d2118b0ef7134db08273a058649d88a27deb4b9d3cc0881bb55119a8
+
+# Kubectl - CLI tool to control Kubernetes clusters -
+KUBECTL_VERSION=1.33.6
+KUBECTL_SHA256SUM=d25d9b63335c038333bed785e9c6c4b0e41d791a09cac5f3e8df9862c684afbe
+
+# Sops - CLI tools need fro helm-secrets - https://github.com/mozilla/sops/releases
+SOPS_VERSION=3.11.0
+SOPS_SHA256SUM=775f1384d55decfad228e7196a3f683791914f92a473f78fc47700531c29dfef
+
+# jq - command-line JSON processor - https://github.com/stedolan/jq/releases
+JQ_VERSION=1.8.1
+JQ_SHA256SUM=020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d
+
+# KubeDOG CLI - https://github.com/werf/kubedog/releases
+KUBEDOG_VERSION=0.13.0
+KUBEDOG_SHA256SUM=24c8ce2bbca495f836b2a9eced4b3d314950008bef26f106752fa5c496c012a6
+
+# CURL CLI - https://github.com/moparisthebest/static-curl/releases
+CURL_VERSION=8.17.0
+CURL_SHA256SUM=b01914a4cbd8497d8550010c2d27d2030614d532aaca60e89a3929a734c451b5
+
+# AGE CLI (замена gpg) - https://github.com/FiloSottile/age/releases
+AGE_VERSION=1.3.1
+AGE_SHA256SUM=0a3a32d5849fe0a76a650e971c74020996f5c9f6e30f5cffbe6ebca1f012807c
+
+#https://github.com/mikefarah/yq/releases
+YQ_VERSION=4.52.2
+YQ_SHA256SUM=a74bd266990339e0c48a2103534aef692abf99f19390d12c2b0ce6830385c459
+
+
+FLUX_VERSION=2.7.5
+FLUX_SHA256SUM=7afd2b1a436effbe1cfeb7a9344bcd049844014320c6c334f0b970cbc8d5e4f2

@@ -1,0 +1,39 @@
+# CURL CLI - https://github.com/moparisthebest/static-curl/releases
+CURL_VERSION=8.17.0
+CURL_SHA256SUM=b01914a4cbd8497d8550010c2d27d2030614d532aaca60e89a3929a734c451b5
+
+#https://github.com/kubernetes-sigs/kustomize/releases
+KUSTOMIZE_VERSION=5.8.0
+KUSTOMIZE_SHA256SUM=69d1e2ddd0517166ad1ffb16496cae7b491979b879f78a5799c2d267c42156ab
+
+#https://github.com/yannh/kubeconform/releases
+KUBECONFORM_VERSION=0.7.0
+KUBECONFORM_SHA256SUM=dd5273bdbf08531bf230f4eba8359984b7beec25a679424ff90911a2591b8b0d
+
+#https://github.com/mikefarah/yq/releases
+YQ_VERSION=4.49.2
+YQ_SHA256SUM=be2c0ddcf426b6a231648610ec5d1666ae50e9f6473e82f6486f9f4cb6e3e2f7
+
+
+TFLINT_VERSION=0.60.0
+TFLINT_SHA256SUM=13e381df98fadae9b43638c49c4725f2db569f7cd0ecd105b5359657a8387c8a
+TFLINT_TF_RULES_VERSION=0.13.0
+
+FLUX_VERSION=2.7.5
+FLUX_SHA256SUM=7afd2b1a436effbe1cfeb7a9344bcd049844014320c6c334f0b970cbc8d5e4f2
+
+#https://github.com/google/go-containerregistry/releases/
+CRANE_VERSION=0.20.7
+CRANE_SHA256SUM=ffe4d4ec41f98975b4487164a94f02ea9c167269ea22aa5c4d8db45fd782a333
+
+#https://github.com/sigstore/cosign/releases
+COSIGN_VERSION=3.0.4
+COSIGN_SHA256SUM=10dab2fd2170b5aa0d5c0673a9a2793304960220b314f6a873bf39c2f08287aa
+
+# jq - command-line JSON processor - https://github.com/stedolan/jq/releases
+JQ_VERSION=1.8.1
+JQ_SHA256SUM=020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d
+
+# Helm - CLI tool for managing Charts - https://github.com/helm/helm/releases
+HELM_VERSION=4.1.0
+HELM_SHA256SUM=519950df50409cb78e460668913de49497f96eb7e229aa584d3a7ed953e7adc7

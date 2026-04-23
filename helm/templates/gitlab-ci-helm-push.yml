@@ -1,0 +1,146 @@
+spec:
+  inputs:
+    helm_image:
+      type: string
+      default: "${HARBOR_HOST}/base-images/infra/cd-tools:v1"
+      description: "Helm tools Docker image"
+    cosign_image:
+      type: string
+      default: "${HARBOR_HOST}/base-images/infra/ci-tools:v1"
+      description: "Ci Docker image to use for scan"
+    helm_dir:
+      type: string
+      default: ".helm"
+      description: "Path to Helm chart directory"
+    debug_mode:
+      type: boolean
+      default: false
+      description: "Enable debug mode (set -x)"
+    # Cosign
+    cosign_enabled:
+      type: boolean
+      default: false
+    cosign_vault_addr:
+      type: string
+      default: "https://vault"
+    cosign_vault_path:
+      type: string
+      default: "cosign"
+    cosign_vault_key:
+      type: string
+      description: "Key on vault"
+      default: "production"
+
+---
+stages:
+  - push
+  - sign
+
+helm:push:
+  stage: push
+  image:
+    name: $[[ inputs.helm_image ]]
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: clone
+    HELM_DIR: $[[ inputs.helm_dir ]]
+    CI_DEBUG: $[[ inputs.debug_mode ]]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+  tags:
+    - infra
+  before_script:
+    - echo "${HARBOR_PASSWORD}"| helm registry login ${HARBOR_HOST} -u "${HARBOR_USERNAME}" --password-stdin
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - helm lint --quiet --strict ${HELM_DIR} -f ${HELM_DIR}/values.yaml
+    - helm package --version ${CI_COMMIT_TAG} "${HELM_DIR}" -d "${HELM_DIR}"
+    - CHART_ARTIFACT_PATH="$(find ${HELM_DIR} -name "*.tgz" -exec realpath {} \; | head -1)"
+    - |
+      output=$(helm push "${CHART_ARTIFACT_PATH}" "${HARBOR_OCI}/helm" 2>&1)
+      echo "IMAGE_DESTINATION=$(echo $output | cut -d' ' -f2)" > build.env
+      echo "IMAGE_DIGEST=$(echo $output | cut -d' ' -f4)" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+    paths:
+      - build.env
+    expire_in: 20 minutes
+#cosign
+sign:oci:
+  stage: sign
+  image: $[[ inputs.cosign_image ]]
+  needs:
+    - job: helm:push
+      optional: false
+  tags:
+    - infra
+  rules:
+    - if: '$CI_COMMIT_TAG && $COSIGN_ENABLED == "true"'
+      when: on_success
+  variables:
+    COSIGN_ENABLED: $[[ inputs.cosign_enabled ]]
+    VAULT_ADDR: $[[ inputs.cosign_vault_addr ]]
+    TRANSIT_SECRET_ENGINE_PATH: $[[ inputs.cosign_vault_path ]]
+    COSIGN_VAULT_KEY: $[[ inputs.cosign_vault_key ]]
+    CI_DEBUG: $[[ inputs.debug_mode ]]
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - mkdir -p /home/deploy/.docker
+    - |
+      cat > "/home/deploy/.docker/config.json" <<EOF
+      {
+        "auths": {
+          "${HARBOR_HOST}": {
+            "username": "${HARBOR_USERNAME}",
+            "password": "${HARBOR_PASSWORD}"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      source build.env
+      IMAGE_FULL_REF="${IMAGE_DESTINATION}@${IMAGE_DIGEST}"
+    - |
+      # ============================================
+      # COSIGN: Подписываем (если включен)
+      # ============================================
+      if [ "${COSIGN_ENABLED}" = "true" ]; then
+        echo "→ Setting up Cosign signing..."
+        if [ -z "${VAULT_ADDR}" ]; then
+          echo "❌ VAULT_ADDR not set"
+          exit 1
+        fi
+        if [ -z "${VAULT_TOKEN}" ] || [ "${VAULT_TOKEN}" = "null" ]; then
+          echo "❌ Vault authentication failed"
+          exit 1
+        fi
+        # Подписываем
+        echo "→ Signing image: ${IMAGE_FULL_REF}"
+        cosign sign --key hashivault://${COSIGN_VAULT_KEY} \
+          -a "git.commit.sha=${CI_COMMIT_SHA}" \
+          -a "git.branch=${CI_COMMIT_REF_NAME}" \
+          -a "gitlab.pipeline.url=${CI_PIPELINE_URL}" \
+          --new-bundle-format=false --use-signing-config=false -y \
+          "${IMAGE_FULL_REF}"
+        # Проверяем подпись
+        cosign verify --key hashivault://${COSIGN_VAULT_KEY} \
+          --insecure-ignore-tlog=true \
+          --insecure-ignore-sct=true \
+          "${IMAGE_FULL_REF}" > /dev/null
+        echo "✓ Image signed and verified"
+      fi
+      echo ""
+      echo "✓ SUCCESS"
+      echo "  Image: ${IMAGE_DESTINATION}"
+      echo "  Digest: ${IMAGE_DIGEST}"

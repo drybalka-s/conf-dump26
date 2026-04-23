@@ -1,0 +1,43 @@
+include:
+  - local: "ci/mr-validate.yml"
+  - local: "ci/prod-sync.yml"
+
+stages:
+  - detect
+  - validate
+  - resolve
+  - test
+  - push
+  - sign
+
+variables:
+  PROXY_REGISTRY_HOST: ${HARBOR_HOST}
+  INTERNAL_REGISTRY_HOST: ${HARBOR_HOST}
+  PROXY_REGISTRY_USER: ${HARBOR_USERNAME}
+  PROXY_REGISTRY_PASS: ${HARBOR_PASSWORD}
+  INTERNAL_REGISTRY_USER: ${HARBOR_USERNAME}
+  INTERNAL_REGISTRY_PASS: ${HARBOR_PASSWORD}
+
+  ##мапинг основных регистри
+  PROXY_REGISTRY_MAPPING_DOCKER_IO: "dhub"
+  PROXY_REGISTRY_MAPPING_GCR_IO: "gcr"
+  PROXY_REGISTRY_MAPPING_GHCR_IO: "ghcr"
+  PROXY_REGISTRY_MAPPING_QUAY_IO: "quay"
+  PROXY_REGISTRY_MAPPING_REGISTRY_K8S_IO: "k8s-io"
+  PROXY_REGISTRY_MAPPING_PUBLIC_ECR_AWS: "ecr-aws"
+  PROXY_REGISTRY_MAPPING_REGISTRY_GITLAB_COM: "gitlab"
+  ##cosgin
+  COSIGN_KEY: "production"
+  COSIGN_VAULT_URL: ${VAULT_ADDR}
+  COSIGN_VAULT_PATH: "cosign"
+  COSIGN_QARANTINE: "harbor/qarantine/signatures"
+  TRANSIT_SECRET_ENGINE_PATH: "${COSIGN_VAULT_PATH}"
+  ##настройки ейрархии
+  INTERNAL_REGISTRY_PROJECT_MODE: ext-images
+  ##настройки scan-security
+  TRIVY_URL: "" #http://trivy.local"
+  TRIVY_TOKEN: ""
+  ## images
+  VALIDATE_IMAGE: "kapistka/pisc:v0.19.0-rc2-feeds" # или ci-tools:v1"
+  SCAN_IMAGE: "kapistka/pisc:v0.19.0-rc2-feeds"
+  CI_DEBUG: "false"

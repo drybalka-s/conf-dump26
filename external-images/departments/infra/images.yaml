@@ -1,0 +1,7 @@
+images:
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-exporter:v18.8.4"
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-shell:v14.45.5"
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-sidekiq-ee:v18.8.4"
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-toolbox-ee:v18.8.4"
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-webservice-ee:v18.8.4"
+  - source: "registry.gitlab.com/gitlab-org/build/cng/gitlab-workhorse-ee:v18.8.4"

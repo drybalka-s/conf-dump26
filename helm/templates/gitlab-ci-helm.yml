@@ -1,0 +1,365 @@
+spec:
+  inputs:
+    helm_image:
+      type: string
+      default: "${HARBOR_HOST}/base-images/infra/cd-tools:v1"
+      description: "Helm tools Docker image"
+    helm_test_image:
+      type: string
+      default: "${HARBOR_HOST}/base-images/infra/ci-tools:v1"
+      description: "Helm tools Docker image"
+    helm_dir:
+      type: string
+      default: ".helm"
+      description: "Path to Helm chart directory"
+    helm_release_name:
+      type: string
+      default: ""
+      description: "Helm release name (required)"
+    helm_release_namespace:
+      type: string
+      default: "default"
+      description: "Helm release namespace"
+    helm_k8s_name:
+      type: string
+      default: ""
+      description: "Kubernetes cluster name for kubeconfig (required, e.g., 'PROD', 'STAGING')"
+    helm_values_file:
+      type: string
+      default: "values.yaml"
+      description: "Path to values.yaml file"
+    helm_secrets_enabled:
+      type: boolean
+      default: false
+      description: "Enable Helm secrets integration"
+    helm_secrets_file:
+      type: string
+      default: "secrets.yaml"
+      description: "Path to secrets.yaml file"
+    helm_timeout:
+      type: string
+      default: "15m"
+      description: "Helm operation timeout"
+    helm_rollback_enabled:
+      type: boolean
+      default: false
+      description: "Enable atomic rollback on failure"
+    kubedog_enabled:
+      type: boolean
+      default: false
+      description: "Enable kubedog for deployment monitoring"
+    helm_sync_enabled:
+      type: boolean
+      default: false
+      description: "Enable helm_sync validation step (separate job)"
+    helm_sync_repo_url:
+      type: string
+      default: ""
+      description: "Repo url to registry oci:// or https://"
+    helm_diff_enabled:
+      type: boolean
+      default: true
+      description: "Enable helm diff step before deploy"
+    helm_options:
+      type: string
+      default: ""
+      description: "Additional Helm options"
+    image_tag_prefix:
+      type: string
+      default: "image.tag"
+      description: "Image tag prefix for values"
+    helm_runner_tags:
+      type: array
+      default: ["infra"]
+      description: "GitLab runner tags"
+    debug_mode:
+      type: boolean
+      default: false
+      description: "Enable debug mode (set -x)"
+    skip_default_jobs:
+      type: boolean
+      default: false
+      description: Отключает создание дефолтных helmdiff/helmdeploy jobs
+---
+image:
+  name: $[[ inputs.helm_image ]]
+  entrypoint: [""]
+variables:
+  GIT_STRATEGY: clone
+  HELM_DIR: $[[ inputs.helm_dir ]]
+  HELM_RELEASE_NAME: $[[ inputs.helm_release_name ]]
+  HELM_RELEASE_NAMESPACE: $[[ inputs.helm_release_namespace ]]
+  HELM_K8S_NAME: $[[ inputs.helm_k8s_name ]]
+  HELM_VALUES_FILE: $[[ inputs.helm_values_file ]]
+  HELM_SECRETS_ENABLED: $[[ inputs.helm_secrets_enabled ]]
+  HELM_SECRETS_FILE: $[[ inputs.helm_secrets_file ]]
+  HELM_OPTIONS: $[[ inputs.helm_options ]]
+  CI_PREFIX_IMAGE_TAG: $[[ inputs.image_tag_prefix ]]
+  CI_DEBUG: $[[ inputs.debug_mode ]]
+  KUBEDOG_ENABLED: $[[ inputs.kubedog_enabled]]
+  HELM_ROLLBACK_ENABLED: $[[ inputs.helm_rollback_enabled ]]
+  HELM_TIMEOUT: $[[ inputs.helm_timeout ]]
+  HELM_REPO_URL: $[[ inputs.helm_sync_repo_url ]]
+  HELM_SYNC_ENABLED: $[[ inputs.helm_sync_enabled ]]
+  SKIP_DEFAULT_JOB: $[[ inputs.skip_default_jobs ]]
+
+helm:sync:
+  image:
+    name: $[[ inputs.helm_test_image ]]
+    entrypoint: [""]
+  stage: sync
+  tags: $[[ inputs.helm_runner_tags ]]
+  rules:
+    - if: '$HELM_SYNC_ENABLED == "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - .helm/Chart.yaml
+      when: always
+  before_script:
+    - echo "${HARBOR_PASSWORD}"| helm registry login ${HARBOR_HOST} -u "${HARBOR_USERNAME}" --password-stdin
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [[ "$HELM_REPO_URL" == oci://* ]]; then
+        # OCI: не нужен HELM_REPO_NAME
+        export HELM_REPO_NAME="${HELM_REPO_URL}"
+      else
+        # HTTP: вычисляем HELM_REPO_NAME
+        export HELM_REPO_NAME=$(yq '.dependencies.[0].name' "${HELM_DIR}/Chart.yaml")
+        helm repo add ${HELM_REPO_NAME} ${HELM_REPO_URL}
+        helm repo update
+      fi
+      export HELM_CHART_NAME=$(yq '.dependencies.[0].name' "${HELM_DIR}/Chart.yaml")
+      export HELM_CHART_VERSION=$(yq '.dependencies.[0].version' "${HELM_DIR}/Chart.yaml")
+      export HELM_CHART_DST_REPO=$(yq '.dependencies.[0].repository' "${HELM_DIR}/Chart.yaml")
+    - helm pull ${HELM_REPO_NAME}/${HELM_CHART_NAME} --version="${HELM_CHART_VERSION}"
+    - CHART_ARTIFACT_PATH="$(find ./ -name "*.tgz" -exec realpath {} \; | head -1)"
+    - |
+      export TRIVY_CHECKS_BUNDLE_REPOSITORY=harbor/base-images/trivy/trivy-checks:2
+      SCAN_DIR=$(mktemp -d)
+      tar xzf "${CHART_ARTIFACT_PATH}" -C "${SCAN_DIR}"
+      cd "${SCAN_DIR}/${HELM_CHART_NAME}" || exit 1
+
+      echo "🔍 SCAN: HELM CHART (Static Analysis)"
+      trivy config --exit-code 1 --severity CRITICAL \
+        --helm-kube-version 1.34.0 \
+        --skip-version-check \
+        --disable-telemetry \
+        --misconfig-scanners helm \
+        ./
+    - |
+      echo "🔍 SCAN: KUBERNETES MANIFESTS (Rendered Analysis)"
+      yq eval ".${HELM_CHART_NAME} | del(.. | .image?)" "${CI_PROJECT_DIR}/${HELM_DIR}/${HELM_VALUES_FILE}" > ext-values.yaml
+
+      # Рендерим манифесты для финальной проверки
+      helm template "${HELM_RELEASE_NAME}" \
+        --namespace "${HELM_RELEASE_NAMESPACE}" \
+        -f values.yaml \
+        -f ext-values.yaml \
+        . > helm-render.yaml
+
+      # Сканируем результат рендеринга
+      trivy config --exit-code 1 --severity CRITICAL --disable-telemetry --helm-kube-version 1.34.0 --skip-version-check helm-render.yaml
+    - |
+      # Выводим перечень образов которые использует чарт
+      echo ""
+      echo "╔════════════════════════════════════╗"
+      echo "║ + Добавь образы в локальный Harbor ║"
+      echo "║   proj: external-images            ║"
+      echo "╚════════════════════════════════════╝"
+      echo ""
+      yq ".. | .image? | select(.)" helm-render.yaml | sort -u
+    - helm push "${CHART_ARTIFACT_PATH}" "${HELM_CHART_DST_REPO}"
+
+.helm:diff:
+  stage: diff
+  tags: $[[ inputs.helm_runner_tags ]]
+  variables:
+    HELM_DIFF_ENABLED: $[[ inputs.helm_diff_enabled ]]
+  rules:
+    - if: '$HELM_DIFF_ENABLED == "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+  needs:
+    - job: helm:sync
+      optional: true
+  before_script:
+    - set -e
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+
+    # Проверка обязательных параметров
+    - |
+      if [ -z "${HELM_RELEASE_NAME}" ]; then
+        echo "❌ ERROR: HELM_RELEASE_NAME is required"
+        echo "Set HELM_RELEASE_NAME in your job variables"
+        exit 1
+      fi
+    - |
+      if [ -z "${HELM_K8S_NAME}" ]; then
+        echo "❌ ERROR: HELM_K8S_NAME is required"
+        echo "Set HELM_K8S_NAME in your job variables (e.g., 'PROD', 'STAGING')"
+        exit 1
+      fi
+
+    # Преобразование HELM_K8S_NAME в верхний регистр и формирование переменной kubeconfig
+    - |
+      HELM_K8S_NAME_UPPER=$(echo "${HELM_K8S_NAME}" | tr '[:lower:]' '[:upper:]')
+      KUBE_CONFIG_VAR="KUBE_CONFIG_${HELM_K8S_NAME_UPPER}"
+      export KUBE_CONFIG_B64_VALUE=$(eval echo "\$${KUBE_CONFIG_VAR}")
+
+      if [ -z "${KUBE_CONFIG_B64_VALUE}" ]; then
+        echo "❌ ERROR: ${KUBE_CONFIG_VAR} is not set"
+        echo "Please set ${KUBE_CONFIG_VAR} variable in CI/CD settings"
+        exit 1
+      fi
+
+      echo "${KUBE_CONFIG_B64_VALUE}" | base64 -d > "${KUBECONFIG}"
+      echo "✓ Kubeconfig loaded for: ${HELM_K8S_NAME_UPPER}"
+
+    - |
+      if [ "${HELM_SECRETS_ENABLED}" == "true" ]; then
+        export HELM_SECRETS_ARG="secrets"
+        export HELM_SECRETS_FILE_ARG="-f ${HELM_SECRETS_FILE}"
+      fi
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+
+    # Подготовка и обновление зависимостей
+    - echo -e "\e[0Ksection_start:$(date +%s):helm_prep[collapsed=true]\r\e[0KHELM PREPARATION..."
+    - cd "${HELM_DIR}"
+    - helm dep update
+    - echo -e "\e[0Ksection_end:$(date +%s):helm_prep\r\e[0K"
+
+    # Helm diff
+    - echo -e "\e[0Ksection_start:$(date +%s):helm_diff[collapsed=false]\r\e[0KHELM DIFF..."
+    - |
+      helm ${HELM_SECRETS_ARG} diff upgrade \
+        ${HELM_RELEASE_NAME} \
+        --set ${CI_PREFIX_IMAGE_TAG}=${CI_COMMIT_TAG} \
+        --namespace="${HELM_RELEASE_NAMESPACE}" \
+        -f "${HELM_VALUES_FILE}" \
+        ${HELM_SECRETS_FILE_ARG} \
+        ${HELM_OPTIONS} \
+        .
+    - echo -e "\e[0Ksection_end:$(date +%s):helm_diff\r\e[0K"
+
+.helm:deploy:
+  stage: deploy
+  tags: $[[ inputs.helm_runner_tags ]]
+  before_script:
+    - set -e
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+
+    # Проверка обязательных параметров
+    - |
+      if [ -z "${HELM_RELEASE_NAME}" ]; then
+        echo "❌ ERROR: HELM_RELEASE_NAME is required"
+        echo "Set HELM_RELEASE_NAME in your job variables"
+        exit 1
+      fi
+    - |
+      if [ -z "${HELM_K8S_NAME}" ]; then
+        echo "❌ ERROR: HELM_K8S_NAME is required"
+        echo "Set HELM_K8S_NAME in your job variables (e.g., 'PROD', 'STAGING')"
+        exit 1
+      fi
+
+    # Преобразование HELM_K8S_NAME в верхний регистр и формирование переменной kubeconfig
+    - |
+      HELM_K8S_NAME_UPPER=$(echo "${HELM_K8S_NAME}" | tr '[:lower:]' '[:upper:]')
+      KUBE_CONFIG_VAR="KUBE_CONFIG_${HELM_K8S_NAME_UPPER}"
+      export KUBE_CONFIG_B64_VALUE=$(eval echo "\$${KUBE_CONFIG_VAR}")
+
+      if [ -z "${KUBE_CONFIG_B64_VALUE}" ]; then
+        echo "❌ ERROR: ${KUBE_CONFIG_VAR} is not set"
+        echo "Please set ${KUBE_CONFIG_VAR} variable in CI/CD settings"
+        exit 1
+      fi
+
+      echo "${KUBE_CONFIG_B64_VALUE}" | base64 -d > "${KUBECONFIG}"
+      echo "✓ Kubeconfig loaded for: ${HELM_K8S_NAME_UPPER}"
+
+    - |
+      if [ "${HELM_SECRETS_ENABLED}" == "true" ]; then
+        export HELM_SECRETS_ARG="secrets"
+        export HELM_SECRETS_FILE_ARG="-f ${HELM_SECRETS_FILE}"
+      fi
+
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+
+    # Подготовка и обновление зависимостей
+    - echo -e "\e[0Ksection_start:$(date +%s):helm_prep[collapsed=true]\r\e[0KHELM PREPARATION..."
+    - cd "${HELM_DIR}"
+    - helm dep update
+    - echo -e "\e[0Ksection_end:$(date +%s):helm_prep\r\e[0K"
+
+    # Подготовка rollback аргументов
+    - |
+      if [ "${HELM_ROLLBACK_ENABLED}" == "true" ] && [ "${KUBEDOG_ENABLED}" == "false" ]; then
+        export HELM_ROLLBACK_ARG="--atomic --wait --timeout ${HELM_TIMEOUT}"
+      fi
+
+    # Развертывание
+    - echo -e "\e[0Ksection_start:$(date +%s):helm_deploy[collapsed=false]\r\e[0KHELM DEPLOY..."
+    - |
+      helm ${HELM_SECRETS_ARG} upgrade -i \
+        --history-max 3 \
+        ${HELM_RELEASE_NAME} \
+        --set ${CI_PREFIX_IMAGE_TAG}=${CI_COMMIT_TAG} \
+        --namespace="${HELM_RELEASE_NAMESPACE}" \
+        -f "${HELM_VALUES_FILE}" \
+        ${HELM_SECRETS_FILE_ARG} \
+        ${HELM_OPTIONS} \
+        ${HELM_ROLLBACK_ARG} \
+        .
+    - echo -e "\e[0Ksection_end:$(date +%s):helm_deploy\r\e[0K"
+    # kubedog мониторинг (если включен)
+    - |
+      if [ "${KUBEDOG_ENABLED}" == "true" ]; then
+        echo -e "\e[0Ksection_start:$(date +%s):kubedog[collapsed=false]\r\e[0KKUBEDOG MONITORING..."
+
+        export KUBEDOG_NO_COLOR=false
+        export KUBEDOG_TERMINAL_WIDTH=180
+
+        helm get manifest ${HELM_RELEASE_NAME} --namespace ${HELM_RELEASE_NAMESPACE} | \
+        kubectl -n ${HELM_RELEASE_NAMESPACE} get -o json -f - | \
+        jq '.items | group_by(.kind) | map({"kind":.[0].kind, "items":map({"ResourceName":.metadata.name,"Namespace":.metadata.namespace,"FailMode":"HopeUntilEndOfDeployProcess","AllowFailuresCount":5})}) | reduce .[] as $item ( {"Deployments":[],"StatefulSets":[]}; if $item.kind=="Deployment" then . + {"Deployments":$item.items} else if $item.kind=="StatefulSet" then . + {"StatefulSets":$item.items} else . end end)' | \
+        kubedog multitrack -t 900 --namespace ${HELM_RELEASE_NAMESPACE}
+
+        echo -e "\e[0Ksection_end:$(date +%s):kubedog\r\e[0K"
+      fi
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+diff:
+  extends: .helm:diff
+  rules:
+    - if: '$SKIP_DEFAULT_JOB == "true"'
+      when: never
+    - if: '$HELM_DIFF_ENABLED == "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+  allow_failure: true
+
+deploy:
+  extends: .helm:deploy
+  rules:
+    - if: '$SKIP_DEFAULT_JOB == "true"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual

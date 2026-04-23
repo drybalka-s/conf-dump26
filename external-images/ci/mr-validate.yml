@@ -1,0 +1,373 @@
+---
+.mr-job:
+  image: $VALIDATE_IMAGE
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - "departments/**/*.yaml"
+      when: on_success
+    - when: never
+  tags:
+    - infra
+
+# 1. Детект изменений
+detect-changes:
+  extends: .mr-job
+  stage: detect
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - git config --global --add safe.directory '*'
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME > images-list.txt
+    - |
+      IMAGE_FILES=$(git ls-files "**/images.yaml")
+      for f in $IMAGE_FILES; do
+        # Проверяем, менялся ли файл
+        if git diff --name-only origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD | grep -q "$f"; then
+          echo "Analyzing changes in $f..."
+
+          # 1. Получаем список из ЦЕЛЕВОЙ ветки (старое состояние)
+          # Если файла не было (новый), old_list будет пустым (подавляем ошибку git show)
+          if git show origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:"$f" > /tmp/raw_old.yaml 2>/dev/null; then
+            yq -r '.images[].source' /tmp/raw_old.yaml 2>/dev/null | grep -v '^null$' | grep -v '^$' | sort > /tmp/old_list.txt
+          else
+            # Файла не было - список пуст
+            touch /tmp/old_list.txt
+          fi
+
+          # 2. Получаем список из ТЕКУЩЕЙ ветки (новое состояние)
+          yq -r '.images[].source' "$f" \
+            | grep -v '^null$' | grep -v '^$' | sort > /tmp/new_list.txt
+
+          # 3. Comm -13 выводит строки, уникальные для 2-го файла (то есть добавленные)
+          # comm -13 old new
+          comm -13 /tmp/old_list.txt /tmp/new_list.txt >> images-list.txt
+        fi
+      done
+      sort -u images-list.txt > images-to-process.txt
+      if [[ "$(wc -l < images-to-process.txt)" != "0" ]]; then
+        echo "Новых/измененных образов: $(wc -l < images-to-process.txt)"
+      else
+        echo "ERROR: отсутсвуют новые образы"
+        echo "SKIP_NEXT_STAGES=true" > skip.env
+        exit 1
+      fi
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - images-to-process.txt
+      - skip.env
+    reports:
+      dotenv: skip.env
+    expire_in: 60 minutes
+
+# 2. Проверка SemVer
+validate-semver-change:
+  extends: .mr-job
+  stage: validate
+  variables:
+    GIT_DEPTH: 0
+  needs:
+    - detect-changes
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      version_ge() {
+        local v1=${1#v}; local v2=${2#v}
+        IFS='.' read -r -a a <<< "${v1//-/.}"
+        IFS='.' read -r -a b <<< "${v2//-/.}"
+        for i in 0 1 2; do
+          local p_a=${a[$i]:-0}; local p_b=${b[$i]:-0}
+          if [ "$p_a" -gt "$p_b" ]; then return 0; fi
+          if [ "$p_a" -lt "$p_b" ]; then return 1; fi
+        done
+        return 0
+      }
+    - git config --global --add safe.directory '*'
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    - |
+      git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+      IMAGE_FILES_CHANGED=$(git diff --name-only origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD | grep "images.yaml")
+      EXIT=0
+      for f in $IMAGE_FILES_CHANGED; do
+        git show origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:"$f" > /tmp/old.yaml 2>/dev/null || touch /tmp/old.yaml
+        cp "$f" /tmp/new.yaml
+        declare -A OLD_TAGS
+        while read -r src; do [ -z "$src" ] && continue; repo=$(echo "$src" | awk -F':' '{print $1}' | awk -F'/' '{print $NF}'); OLD_TAGS["$repo"]="${src##*:}"; done < <(yq -r '.images[].source'  /tmp/old.yaml | grep -v '^null$' | grep -v '^$')
+        while read -r src; do [ -z "$src" ] && continue; repo=$(echo "$src" | awk -F':' '{print $1}' | awk -F'/' '{print $NF}'); new_tag=${src##*:}; old_tag=${OLD_TAGS["$repo"]}
+          if [ -n "$old_tag" ] && [ "$old_tag" != "$new_tag" ]; then
+            if ! version_ge "$new_tag" "$old_tag"; then
+              echo "ERROR: trying to downgrade from $old_tag to $new_tag ($repo)"; EXIT=1;
+            fi
+          fi
+        done < <(yq -r '.images[].source'  /tmp/new.yaml | grep -v '^null$' | grep -v '^$' )
+      done
+      exit $EXIT
+# 3. Статические проверки
+validate-duplicate:
+  extends: .mr-job
+  stage: validate
+  variables:
+    GIT_DEPTH: 0
+  needs:
+    - detect-changes
+    - validate-semver-change
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - git config --global --add safe.directory '*'
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    - |
+      IMAGE_FILES_CHANGED=$(git diff --name-only origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD | grep "images.yaml")
+      EXIT=0
+      for f in $IMAGE_FILES_CHANGED; do
+        echo "🔍 Статический анализ: $f"
+        REPOS=$(yq -r '.images[].source' "$f" | grep -v '^null$' | grep -v '^$' | awk -F'/' '{print $NF}' | awk -F':' '{print $1}' | sort | uniq -d)
+        if [ -n "$REPOS" ]; then
+          echo "ERROR: Duplicate container name found: $REPOS"; EXIT=1;
+        fi
+      done
+
+      while read -r SRC; do
+        TAG=${SRC##*:}
+        if [ "$SRC" = "$TAG" ] || [ "$TAG" = "latest" ]; then
+          echo "ERROR: '$SRC' uses forbidden tag (latest or empty)"; EXIT=1
+        fi
+      done < images-to-process.txt
+      exit $EXIT
+# 4. Резолв прокси
+validate-resolve:
+  extends: .mr-job
+  stage: validate
+  variables:
+    GIT_DEPTH: 0
+  needs:
+    - detect-changes
+    - validate-duplicate
+  before_script:
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$PROXY_REGISTRY_HOST": {
+            "username": "$PROXY_REGISTRY_USER",
+            "password": "$PROXY_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      resolve_proxy_url() {
+        local src=$1; local host=$2
+        if [[ "$src" != *"/"* ]]; then src="docker.io/library/$src"; elif [[ "$src" != *"."*/* ]]; then src="docker.io/$src"; fi
+        local domain="${src%%/*}"; local path="${src#*/}"
+        local env_var="PROXY_REGISTRY_MAPPING_${domain//./_}"; env_var="${env_var^^}"
+        local proj=$(eval echo \$$env_var)
+        if [ -z "$proj" ]; then echo "ERROR: No mapping for domain '$domain' ($env_var)" >&2; return 1; fi
+        echo "${host}/${proj}/${path}"
+      }
+    - |
+      while read -r SRC; do
+        if ! PROXY_IMG=$(resolve_proxy_url "$SRC" "$PROXY_REGISTRY_HOST"); then EXIT=1; continue; fi
+        echo "Checking Proxy: $PROXY_IMG"
+        #Проверка  доступности
+        DIGEST=$(crane digest --platform linux/amd64 "$PROXY_IMG")
+
+        # 1. Получаем Digest для Pinning
+        DIGEST=$(crane digest --platform linux/amd64 "$PROXY_IMG") || { echo "ERROR: Image pull failed (digest error): $PROXY_IMG"; exit 1; }
+
+        # 2. Формируем REPO@DIGEST (отрезаем тег)
+        PROXY_REPO=${PROXY_IMG%%:*}
+        PROXY_REF="${PROXY_REPO}@${DIGEST}"
+
+        echo "${PROXY_IMG}|${PROXY_REF}" >> images-to-test.txt
+      done < images-to-process.txt
+  artifacts:
+    paths:
+      - images-to-test.txt
+    expire_in: 360 minutes
+
+# 5. Запуск тестов
+# 5.1. Сканирование на безопасность
+scan-security:
+  image:
+    name: $SCAN_IMAGE
+    pull_policy: always
+  extends: .mr-job
+  stage: test
+  needs:
+    - detect-changes
+    - validate-resolve
+  variables:
+    KUBERNETES_CPU_REQUEST: "500m"
+    KUBERNETES_MEMORY_REQUEST: "512Mi"
+    KUBERNETES_MEMORY_LIMIT: "4Gi"
+    RUNNER_SCRIPT_TIMEOUT: 360m
+    REQUEST_LIMIT: "true"
+    TRIVY_DB_REPOSITORY: ${HARBOR_HOST}/base-images/trivy/trivy-db
+    TRIVY_JAVA_DB_REPOSITORY: ${HARBOR_HOST}/base-images/trivy/trivy-java-db
+    TRIVY_CHECKS_BUNDLE_REPOSITORY: ${HARBOR_HOST}/base-images/trivy/trivy-checks
+    GRYPE_DB_VALIDATE_AGE: false
+  before_script:
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$PROXY_REGISTRY_HOST": {
+            "username": "$PROXY_REGISTRY_USER",
+            "password": "$PROXY_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+        export DEBUG="-x"
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      while IFS='|' read -r PROXY_IMG PROXY_REF; do
+        echo "🔍 SCAN: $PROXY_IMG"
+        MAX_RETRIES=2
+        RETRY_COUNT=0
+        while :; do
+          set +e
+          /bin/bash $DEBUG /home/nonroot/scan.sh \
+            -dem \
+            --offline-feeds \
+            --yara \
+            --exclusions-file "${CI_PROJECT_DIR}/whitelist.yaml" \
+            --auth-file "${DOCKER_CONFIG}/config.json" \
+            --scanner all \
+            --show-exploits \
+            --severity-min HIGH \
+            --trivy-server $TRIVY_URL \
+            --trivy-token $TRIVY_TOKEN \
+            --virustotal-key $VIRUSTOTAL_KEY \
+            -i ${PROXY_IMG}
+            EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -eq 0 ]; then
+            #echo "OK exit code $EXIT_CODE"
+            break
+          fi
+
+          if [ $EXIT_CODE -eq 2 ]; then
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⚠️ Retry $RETRY_COUNT/$MAX_RETRIES for $PROXY_IMG (Exit code 2)"
+              sleep 5
+              continue
+            else
+              echo "❌ ERROR: Max retries reached for $PROXY_IMG"
+              exit 1
+            fi
+          fi
+          # Любой другой код (не 0 и не 2) считаем критическим
+          echo "🚨 ERROR: (Exit code: $EXIT_CODE) on $PROXY_IMG"
+          exit $EXIT_CODE
+        done
+      done < images-to-test.txt
+
+# 2. Sign
+sign-result:
+  extends: .mr-job
+  stage: sign
+  needs:
+    - detect-changes
+    - scan-security
+    - validate-resolve
+  variables:
+    COSIGN_REPOSITORY: ${COSIGN_QARANTINE}
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$INTERNAL_REGISTRY_HOST": {
+            "username": "$INTERNAL_REGISTRY_USER",
+            "password": "$INTERNAL_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      if [ -n "$COSIGN_VAULT_URL" ]; then
+        echo "🔐 Using HashiCorp Vault for signing..."
+        export VAULT_ADDR=$COSIGN_VAULT_URL
+        export TRANSIT_SECRET_ENGINE_PATH=${COSIGN_VAULT_PATH}
+        KEY_URI="hashivault://${COSIGN_KEY}"
+      else
+        echo "🔐 Using Private Key file..."
+        echo "$COSIGN_KEY" > /tmp/cosign.key
+        KEY_URI="/tmp/cosign.key"
+      fi
+    - |
+      while IFS='|' read -r PROXY_IMG PROXY_REF; do
+        echo "✍️ Signing: $PROXY_IMG"
+        cosign sign --key ${KEY_URI} \
+          -a "git.commit.sha=${CI_COMMIT_SHA}" \
+          -a "git.branch=${CI_COMMIT_REF_NAME}" \
+          -a "gitlab.pipeline.url=${CI_PIPELINE_URL}" \
+          --tlog-upload=false \
+          --new-bundle-format=false \
+          --use-signing-config=false -y "${PROXY_REF}" > /dev/null
+        # Проверяем подпись
+        cosign verify --key ${KEY_URI} \
+          --insecure-ignore-tlog=true \
+          --insecure-ignore-sct=true "${PROXY_REF}" > /dev/null
+        echo "✓ Image signed and verified"
+      done < images-to-test.txt

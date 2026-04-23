@@ -1,0 +1,233 @@
+---
+.prod-job:
+  image: $VALIDATE_IMAGE
+  resource_group: prod-registry
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - "departments/**/*.yaml"
+      when: on_success
+    - when: never
+  tags:
+    - infra
+# 1. Resolve Digests
+resolve-digests:
+  stage: resolve
+  extends: .prod-job
+  before_script:
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$PROXY_REGISTRY_HOST": {
+            "username": "$PROXY_REGISTRY_USER",
+            "password": "$PROXY_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - git config --global --add safe.directory '*'
+    - DIFF_RANGE="HEAD~1..HEAD"
+    - |
+      resolve_proxy_url() {
+        local src=$1; local host=$2
+        if [[ "$src" != *"/"* ]]; then src="docker.io/library/$src"; elif [[ "$src" != *"."*/* ]]; then src="docker.io/$src"; fi
+        local domain="${src%%/*}"; local path="${src#*/}"
+        local env_var="PROXY_REGISTRY_MAPPING_${domain//./_}"; env_var="${env_var^^}"
+        local proj=$(eval echo \$$env_var)
+        if [ -z "$proj" ]; then echo "ERROR: No mapping for $domain" >&2; return 1; fi
+        echo "${host}/${proj}/${path}"
+      }
+    - MODE=${INTERNAL_REGISTRY_PROJECT_MODE:-"hierarchical"}
+    - IMAGE_FILES=$(git diff --name-only $DIFF_RANGE | grep "images.yaml" || true)
+    - "> pipeline-manifest.txt"
+    - |
+      for f in $IMAGE_FILES; do
+        if [ ! -f "$f" ]; then continue; fi # Проверка на случай удаления файла
+
+        DIR_STRUCTURE=$(dirname "$f" | sed 's|^departments/||')
+        #1. Получаем список ВСЕХ образов из текущей версии файла
+        NEW_LIST=$(yq -r '.images[].source' "$f" | grep -v 'null' | sort)
+
+        # 2. Получаем список образов из версии ДО слияния (HEAD~1)
+        # Если файл новый, OLD_LIST будет пустым
+        OLD_LIST=$(git show HEAD~1:"$f" 2>/dev/null | yq -r '.images[].source' 2>/dev/null | grep -v 'null' | sort || echo "")
+
+        # 3. Находим только реально НОВЫЕ строки (те, что есть в NEW, но нет в OLD)
+        # comm -13 удаляет колонку 1 (только в OLD) и колонку 2 (общие)
+        SOURCES=$(comm -13 <(echo "$OLD_LIST") <(echo "$NEW_LIST"))
+
+        if [ -z "$SOURCES" ]; then
+          echo "No new images in $f"
+          echo "SKIP_NEXT_STAGES=true" > skip.env
+          exit 1
+        fi
+
+        for SRC in $SOURCES; do
+          echo "Found new image: $SRC"
+
+          PROXY_IMG=$(resolve_proxy_url "$SRC" "$PROXY_REGISTRY_HOST")
+
+          # 1. Получаем Digest для Pinning
+          DIGEST=$(crane digest --platform linux/amd64 "$PROXY_IMG") || { echo "ERROR: Image pull failed: $PROXY_IMG"; exit 1; }
+
+          # 2. Формируем REPO@DIGEST
+          PROXY_REPO=${PROXY_IMG%%:*}
+          PROXY_REF="${PROXY_REPO}@${DIGEST}"
+
+          # 3. Формируем Target
+          NAME=${SRC##*/}; NAME=${NAME%%:*}; TAG=${SRC##*:}
+
+          if [ "$MODE" = "hierarchical" ]; then
+            INTERNAL_TARGET="${INTERNAL_REGISTRY_HOST}/${DIR_STRUCTURE}/${NAME}:${TAG}"
+          else
+            INTERNAL_TARGET="${INTERNAL_REGISTRY_HOST}/${MODE}/${DIR_STRUCTURE}/${NAME}:${TAG}"
+          fi
+
+          CURRENT_INTERNAL_DIGEST=$(crane digest --platform linux/amd64 "$INTERNAL_TARGET" 2>/dev/null || echo "")
+          if [ "$CURRENT_INTERNAL_DIGEST" = "$DIGEST" ]; then
+            echo "SKIP: $INTERNAL_TARGET already exists"
+          else
+            echo "UPDATE: $INTERNAL_TARGET"
+            echo "${PROXY_REF}|${INTERNAL_TARGET}|${DIGEST}" >> pipeline-manifest.txt
+          fi
+        done
+      done
+  allow_failure: true
+  artifacts:
+    when: always
+    reports:
+      dotenv: skip.env
+    paths:
+      - pipeline-manifest.txt
+      - skip.env
+    expire_in: 10 minutes
+
+# 3. Push
+push-internal:
+  stage: push
+  extends: .prod-job
+  needs:
+    - resolve-digests
+  variables:
+    COSIGN_REPOSITORY: ${COSIGN_QARANTINE}
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$PROXY_REGISTRY_HOST": {
+            "username": "$PROXY_REGISTRY_USER",
+            "password": "$PROXY_REGISTRY_PASS"
+          },
+          "$INTERNAL_REGISTRY_HOST": {
+            "username": "$INTERNAL_REGISTRY_USER",
+            "password": "$INTERNAL_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      if [ -n "$COSIGN_VAULT_URL" ]; then
+        echo "🔐 Using HashiCorp Vault for signing..."
+        export VAULT_ADDR=$COSIGN_VAULT_URL
+        export TRANSIT_SECRET_ENGINE_PATH=${COSIGN_VAULT_PATH}
+        KEY_URI="hashivault://${COSIGN_KEY}"
+      else
+        echo "🔐 Using Private Key file..."
+        echo "$COSIGN_KEY" > /tmp/cosign.key
+        KEY_URI="/tmp/cosign.key"
+      fi
+    - |
+      while IFS='|' read -r PROXY_REF TARGET DIGEST; do
+        $(cosign verify --key ${KEY_URI} \
+          --insecure-ignore-tlog=true \
+          --insecure-ignore-sct=true \
+          "${PROXY_REF}" > /dev/null) || { echo "❌ ERROR: Image $PROXY_REF not verified"; exit 1; }
+
+          echo "✓ Image verified"
+          echo "📦 Copy: $PROXY_REF → $TARGET"
+          crane copy --platform linux/amd64 "$PROXY_REF" "$TARGET"
+
+      done < pipeline-manifest.txt
+
+# 4. Sign
+sign-internal:
+  stage: sign
+  extends: .prod-job
+  needs:
+    - resolve-digests
+    - push-internal
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - export DOCKER_CONFIG=$(mktemp -d)
+    - export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+    - |
+      cat > "${DOCKER_CONFIG}/config.json" <<EOF
+      {
+        "auths": {
+          "$INTERNAL_REGISTRY_HOST": {
+            "username": "$INTERNAL_REGISTRY_USER",
+            "password": "$INTERNAL_REGISTRY_PASS"
+          }
+        }
+      }
+      EOF
+  script:
+    - |
+      if [ "${CI_DEBUG}" = "true" ]; then
+        set -x
+      fi
+    - |
+      if [ "$SKIP_NEXT_STAGES" = "true" ]; then
+        echo "Bypassing sync as requested."
+        exit 0
+      fi
+    - |
+      if [ -n "$COSIGN_VAULT_URL" ]; then
+        echo "🔐 Using HashiCorp Vault for signing..."
+        export VAULT_ADDR=$COSIGN_VAULT_URL
+        export TRANSIT_SECRET_ENGINE_PATH=${COSIGN_VAULT_PATH}
+        KEY_URI="hashivault://${COSIGN_KEY}"
+      else
+        echo "🔐 Using Private Key file..."
+        echo "$COSIGN_KEY" > /tmp/cosign.key
+        KEY_URI="/tmp/cosign.key"
+      fi
+    - |
+      while IFS='|' read -r PROXY_REF TARGET DIGEST; do
+        echo "✍️ Signing: $TARGET"
+        cosign sign --key ${KEY_URI} \
+          -a "git.commit.sha=${CI_COMMIT_SHA}" \
+          -a "git.branch=${CI_COMMIT_REF_NAME}" \
+          -a "gitlab.pipeline.url=${CI_PIPELINE_URL}" \
+          --tlog-upload=false \
+          --new-bundle-format=false --use-signing-config=false -y \
+          "${TARGET}@${DIGEST}" > /dev/null
+        # Проверяем подпись
+        cosign verify --key ${KEY_URI} \
+          --insecure-ignore-tlog=true \
+          --insecure-ignore-sct=true \
+          "${TARGET}" > /dev/null
+        echo "✓ Image verified"
+      done < pipeline-manifest.txt

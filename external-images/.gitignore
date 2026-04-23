@@ -1,0 +1,8 @@
+.DS_Store
+*.txt
+*.yaml
+!departments/**/*.yaml
+!ci/**/*.yml
+!.gitlab-ci.yml
+/tmp/
+cosign.key

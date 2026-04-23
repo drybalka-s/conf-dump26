@@ -1,0 +1,43 @@
+include:
+  - project: "infrastructure/gitlab-remote-includes"
+    ref: main
+    file:
+      - "git_semantic_release.yaml"
+
+stages:
+  - validate
+  - release
+
+# Валидация YAML синтаксиса
+validate:yaml:
+  stage: validate
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yamllint
+  script:
+    - yamllint -d relaxed templates/gitlab-ci-helm.yml
+    - echo "✓ YAML syntax is valid"
+  only:
+    - merge_requests
+  tags:
+    - k8s-dev
+
+# Валидация структуры компонента
+validate:component:
+  stage: validate
+  image: alpine:latest
+  script:
+    - |
+      # Проверить наличие обязательных файлов
+      test -f "templates/gitlab-ci-helm.yml" || exit 1
+      test -f "CHANGELOG.md" || exit 1
+      echo "✓ All required files present"
+    - |
+      # Проверить структуру YAML
+      grep -q "^spec:" templates/gitlab-ci-helm.yml || exit 1
+      grep -q "^---" templates/gitlab-ci-helm.yml || exit 1
+      echo "✓ Component structure is valid"
+  only:
+    - merge_requests
+  tags:
+    - k8s-dev
